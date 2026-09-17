@@ -26,14 +26,112 @@ const tierMultiplier = {
   BRONZE: 1,
   SILVER: 2,
   GOLD: 3,
+  PLATINUM: 0.3,
 };
 
+let applicationClock = new Date();
+
+function getCurrentClock() {
+  return applicationClock;
+}
+
+function setCurrentClock(value) {
+  const nextClock = new Date(value);
+  if (Number.isNaN(nextClock.getTime())) {
+    throw new Error("Invalid clock value");
+  }
+  applicationClock = nextClock;
+  return applicationClock;
+}
+
 function getTierFromLifetimeSpend(totalSpentCents) {
+  if (totalSpentCents >= 500000) return "PLATINUM";
+
   const totalSpentRupees = totalSpentCents / 100;
 
   if (totalSpentRupees >= 15000) return "GOLD";
   if (totalSpentRupees >= 5000) return "SILVER";
   return "BRONZE";
+}
+
+async function expireStaleEarnedPoints(now = getCurrentClock()) {
+  const expiredEvents = await prisma.pointEvent.findMany({
+    where: {
+      type: "EARN",
+      expiresAt: { lte: now },
+      expiredAt: null,
+    },
+    orderBy: { createdAt: "asc" },
+  });
+
+  if (!expiredEvents.length) {
+    return { expiredPointEvents: 0, expiredPoints: 0 };
+  }
+
+  const eventsByMember = new Map();
+  for (const event of expiredEvents) {
+    const list = eventsByMember.get(event.memberId) || [];
+    list.push(event);
+    eventsByMember.set(event.memberId, list);
+  }
+
+  let expiredPointEvents = 0;
+  let expiredPoints = 0;
+
+  for (const [memberId, events] of eventsByMember.entries()) {
+    await prisma.$transaction(async (tx) => {
+      const currentMember = await tx.member.findUnique({ where: { id: memberId } });
+      if (!currentMember) return;
+
+      const claimedEvents = [];
+      for (const event of events) {
+        const claimed = await tx.pointEvent.updateMany({
+          where: {
+            id: event.id,
+            type: "EARN",
+            expiresAt: { lte: now },
+            expiredAt: null,
+          },
+          data: { expiredAt: now },
+        });
+
+        if (claimed.count === 1) {
+          claimedEvents.push(event);
+        }
+      }
+
+      if (!claimedEvents.length) return;
+
+      const expiredTotal = claimedEvents.reduce(
+        (sum, event) => sum + Number(event.deltaPoints || 0),
+        0
+      );
+      const currentPoints = Number(currentMember.points || 0);
+      const actualReduction = Math.min(currentPoints, expiredTotal);
+      const nextPoints = Math.max(0, currentPoints - actualReduction);
+
+      if (actualReduction > 0) {
+        await tx.member.update({
+          where: { id: memberId },
+          data: { points: nextPoints },
+        });
+
+        await tx.pointEvent.create({
+          data: {
+            memberId,
+            type: "ADJUSTMENT",
+            deltaPoints: -actualReduction,
+            reason: "Expired earned points",
+          },
+        });
+      }
+
+      expiredPointEvents += claimedEvents.length;
+      expiredPoints += actualReduction;
+    });
+  }
+
+  return { expiredPointEvents, expiredPoints };
 }
 
 function signToken(staff) {
@@ -241,7 +339,9 @@ app.post("/api/purchases", requireAuth, async (req, res) => {
   try {
     const { phone, amountCents } = req.body;
 
-    if (!phone || !amountCents || Number(amountCents) <= 0) {
+    const purchaseAmountCents = Number(amountCents);
+
+    if (!phone || !amountCents || !Number.isFinite(purchaseAmountCents) || purchaseAmountCents <= 0) {
       return res.status(400).json({ message: "Phone and positive amountCents are required" });
     }
 
@@ -250,13 +350,12 @@ app.post("/api/purchases", requireAuth, async (req, res) => {
       return res.status(404).json({ message: "Member not found" });
     }
 
-  const pointsAwarded = Math.floor(
-  (Number(amountCents) / 100) * tierMultiplier[member.tier]
-);
+    const previousTier = member.tier;
+    const pointsAwarded = (purchaseAmountCents / 100) * Number(tierMultiplier[member.tier] || tierMultiplier.BRONZE);
+    const newPoints = Number(member.points) + pointsAwarded;
+    const newTotalSpent = member.totalSpent + purchaseAmountCents;
+    const newTier = getTierFromLifetimeSpend(newTotalSpent);
 
-const newPoints = member.points + pointsAwarded;
-const newTotalSpent = member.totalSpent + Number(amountCents);
-const newTier = getTierFromLifetimeSpend(newTotalSpent);
     const result = await prisma.$transaction(async (tx) => {
       const updatedMember = await tx.member.update({
         where: { id: member.id },
@@ -270,20 +369,37 @@ const newTier = getTierFromLifetimeSpend(newTotalSpent);
       const purchase = await tx.purchase.create({
         data: {
           memberId: member.id,
-          amountCents: Number(amountCents),
+          amountCents: purchaseAmountCents,
           pointsAwarded,
           pointsBalanceAfter: newPoints,
         },
       });
+
+      const expiresAt = new Date(getCurrentClock().getTime() + 90 * 24 * 60 * 60 * 1000);
 
       await tx.pointEvent.create({
         data: {
           memberId: member.id,
           type: "EARN",
           deltaPoints: pointsAwarded,
-          reason: `Purchase of ${amountCents} cents`,
+          reason: `Purchase of ${purchaseAmountCents} cents`,
+          expiresAt,
         },
       });
+
+      if (previousTier !== newTier) {
+        await tx.outboxEvent.create({
+          data: {
+            type: "TIER_CHANGED",
+            memberId: member.id,
+            payload: JSON.stringify({
+              memberId: member.id,
+              previousTier,
+              newTier,
+            }),
+          },
+        });
+      }
 
       return { purchase, member: updatedMember };
     });
@@ -297,8 +413,9 @@ const newTier = getTierFromLifetimeSpend(newTotalSpent);
 app.post("/api/redemptions", requireAuth, async (req, res) => {
   try {
     const { phone, itemName, pointsUsed } = req.body;
+    const redemptionPoints = Number(pointsUsed);
 
-    if (!phone || !itemName || !pointsUsed || Number(pointsUsed) <= 0) {
+    if (!phone || !itemName || !pointsUsed || !Number.isFinite(redemptionPoints) || redemptionPoints <= 0) {
       return res.status(400).json({ message: "Phone, itemName, and positive pointsUsed are required" });
     }
 
@@ -307,19 +424,17 @@ app.post("/api/redemptions", requireAuth, async (req, res) => {
       return res.status(404).json({ message: "Member not found" });
     }
 
-    if (member.points < Number(pointsUsed)) {
+    if (Number(member.points || 0) < redemptionPoints) {
       return res.status(400).json({ message: "Insufficient points balance" });
     }
 
-    const newPoints = member.points - Number(pointsUsed);
-    const newTier = getTierFromPoints(newPoints);
+    const newPoints = Math.max(0, Number(member.points || 0) - redemptionPoints);
 
     const result = await prisma.$transaction(async (tx) => {
       const updatedMember = await tx.member.update({
         where: { id: member.id },
         data: {
           points: newPoints,
-          tier: newTier,
         },
       });
 
@@ -327,7 +442,7 @@ app.post("/api/redemptions", requireAuth, async (req, res) => {
         data: {
           memberId: member.id,
           itemName,
-          pointsUsed: Number(pointsUsed),
+          pointsUsed: redemptionPoints,
           status: "COMPLETED",
         },
       });
@@ -336,7 +451,7 @@ app.post("/api/redemptions", requireAuth, async (req, res) => {
         data: {
           memberId: member.id,
           type: "REDEEM",
-          deltaPoints: -Number(pointsUsed),
+          deltaPoints: -redemptionPoints,
           reason: `Redeemed ${itemName}`,
         },
       });
@@ -347,6 +462,42 @@ app.post("/api/redemptions", requireAuth, async (req, res) => {
     res.status(201).json({ message: "Redemption processed", ...result });
   } catch (error) {
     res.status(500).json({ message: "Redemption failed", error: error.message });
+  }
+});
+
+app.post("/api/clock", requireAuth, async (req, res) => {
+  try {
+    const { now } = req.body;
+
+    if (now) {
+      setCurrentClock(now);
+    }
+
+    const result = await expireStaleEarnedPoints(getCurrentClock());
+
+    res.json({
+      currentClock: getCurrentClock().toISOString(),
+      expiredPointEvents: result.expiredPointEvents,
+      expiredPoints: result.expiredPoints,
+    });
+  } catch (error) {
+    res.status(400).json({ message: "Invalid clock value", error: error.message });
+  }
+});
+
+app.get("/api/clock", requireAuth, (req, res) => {
+  res.json({ currentClock: getCurrentClock().toISOString() });
+});
+
+app.get("/api/outbox", requireAuth, async (req, res) => {
+  try {
+    const events = await prisma.outboxEvent.findMany({
+      orderBy: { createdAt: "desc" },
+    });
+
+    res.json({ outboxEvents: events });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to fetch outbox", error: error.message });
   }
 });
 

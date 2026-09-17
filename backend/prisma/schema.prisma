@@ -10,6 +10,7 @@ enum Tier {
   BRONZE
   SILVER
   GOLD
+  PLATINUM
 }
 
 enum PurchaseType {
@@ -41,14 +42,15 @@ model Member {
   phone       String        @unique
   email       String?       @unique
   tier        Tier          @default(BRONZE)
-  points      Int           @default(0)
+  points      Float         @default(0)
   totalSpent  Int           @default(0)
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
 
-  purchases   Purchase[]
-  redemptions Redemption[]
-  pointEvents PointEvent[]
+  purchases    Purchase[]
+  redemptions  Redemption[]
+  pointEvents  PointEvent[]
+  outboxEvents OutboxEvent[]
 }
 
 model Purchase {
@@ -56,8 +58,8 @@ model Purchase {
   memberId           String
   member             Member   @relation(fields: [memberId], references: [id])
   amountCents        Int
-  pointsAwarded      Int
-  pointsBalanceAfter Int
+  pointsAwarded      Float
+  pointsBalanceAfter Float
   createdAt          DateTime @default(now())
 }
 
@@ -66,7 +68,7 @@ model Redemption {
   memberId   String
   member     Member           @relation(fields: [memberId], references: [id])
   itemName   String
-  pointsUsed Int
+  pointsUsed Float
   status     RedemptionStatus @default(PENDING)
   createdAt  DateTime         @default(now())
 }
@@ -76,7 +78,20 @@ model PointEvent {
   memberId    String
   member      Member       @relation(fields: [memberId], references: [id])
   type        PurchaseType
-  deltaPoints Int
+  deltaPoints Float
   reason      String
+  expiresAt   DateTime?
+  expiredAt   DateTime?
   createdAt   DateTime     @default(now())
 }
+
+model OutboxEvent {
+  id          String    @id @default(uuid())
+  type        String
+  memberId    String
+  member      Member    @relation(fields: [memberId], references: [id])
+  payload     String
+  createdAt   DateTime  @default(now())
+  processedAt DateTime?
+}
+
