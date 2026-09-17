@@ -1,0 +1,82 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+enum Tier {
+  BRONZE
+  SILVER
+  GOLD
+}
+
+enum PurchaseType {
+  EARN
+  REDEEM
+  ADJUSTMENT
+}
+
+enum RedemptionStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+}
+
+model Staff {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  username     String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}
+
+model Member {
+  id          String        @id @default(uuid())
+  firstName   String
+  lastName    String
+  phone       String        @unique
+  email       String?       @unique
+  tier        Tier          @default(BRONZE)
+  points      Int           @default(0)
+  totalSpent  Int           @default(0)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  purchases   Purchase[]
+  redemptions Redemption[]
+  pointEvents PointEvent[]
+}
+
+model Purchase {
+  id                 String   @id @default(uuid())
+  memberId           String
+  member             Member   @relation(fields: [memberId], references: [id])
+  amountCents        Int
+  pointsAwarded      Int
+  pointsBalanceAfter Int
+  createdAt          DateTime @default(now())
+}
+
+model Redemption {
+  id         String           @id @default(uuid())
+  memberId   String
+  member     Member           @relation(fields: [memberId], references: [id])
+  itemName   String
+  pointsUsed Int
+  status     RedemptionStatus @default(PENDING)
+  createdAt  DateTime         @default(now())
+}
+
+model PointEvent {
+  id          String       @id @default(uuid())
+  memberId    String
+  member      Member       @relation(fields: [memberId], references: [id])
+  type        PurchaseType
+  deltaPoints Int
+  reason      String
+  createdAt   DateTime     @default(now())
+}
